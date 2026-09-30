@@ -12,12 +12,12 @@ The model key is a **Fly runtime secret**, never part of the image or browser co
 
 Anonymous inference is deliberately bounded:
 
-- Ten searches per minute per client IP, one active search per client, four active searches overall, and twelve upstream evaluations in flight.
-- A persistent **25,000,000-input-token budget per UTC day**, about **$1.05 at the current TypeSafe price**, excluding startup connection checks and hosting. This normally covers about ninety short-message rankings, with fewer possible after failures or cancellations.
+- Ten searches per minute per client IP, one active search per client, four active searches overall, and twenty upstream evaluations in flight.
+- A persistent **119,000,000-input-token budget per UTC day**, about **$5 at the current TypeSafe price**, excluding startup connection checks and hosting. This normally covers roughly 440 short-message rankings, with fewer possible after failures or cancellations.
 - Before paid inference, reserve 65,536 tokens for every planned provider request, conservatively covering Jev's documented 64k request ceiling. Successful requests release the difference from reported usage. Failures, cancellations, and missing usage retain the full reservation. Searches are charged to the UTC day on which they start.
 - The aggregate ledger lives at `/data/usage.json`, is serialized and synced to disk before paid work, and survives restarts. Invalid or unavailable storage fails closed. No messages or client IPs are written to this ledger.
 
-These are app-level limits, not a provider billing guarantee. Other apps using the same key, changing model prices/limits, or adding replicas can change total spending. Keep this deployment at **one Machine**, preserve its volume, and use account-level spending controls where available. Do not delete the ledger to recover from a quota error; it resets at midnight UTC. Changing `BUFO_DAILY_TOKEN_LIMIT` in `fly.toml` changes the allowance after redeploy.
+These are app-level limits, not a provider billing guarantee. The `DAILY_BUDGET` error means this app's allowance is exhausted, not that TypeSafe credits are unavailable; buying provider credits alone will not change it. Other apps using the same key, changing model prices/limits, or adding replicas can change total spending. Keep this deployment at **one Machine**, preserve its volume, and use account-level spending controls where available. Do not delete the ledger to recover from a quota error; it resets at midnight UTC. Changing `BUFO_DAILY_TOKEN_LIMIT` in `fly.toml` changes the allowance after redeploy without clearing existing usage. Reload a browser tab showing the old quota error to clear its cached retry cooldown.
 
 To refresh the snapshot and redeploy, run from the repo root with Fly and source access:
 
