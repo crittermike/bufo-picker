@@ -19,10 +19,9 @@ Anonymous inference is deliberately bounded:
 
 These are app-level limits, not a provider billing guarantee. Other apps using the same key, changing model prices/limits, or adding replicas can change total spending. Keep this deployment at **one Machine**, preserve its volume, and use account-level spending controls where available. Do not delete the ledger to recover from a quota error; it resets at midnight UTC. Changing `BUFO_DAILY_TOKEN_LIMIT` in `fly.toml` changes the allowance after redeploy.
 
-To refresh the snapshot and redeploy from a checkout with Fly and source access:
+To refresh the snapshot and redeploy, run from the repo root with Fly and source access:
 
 ```sh
-cd bufo
 npm run sync
 npm run export
 flyctl deploy --remote-only --depot=false --ha=false
@@ -62,10 +61,10 @@ The server refuses incomplete shared configuration. Startup checks Jev access wi
 Build the source-only container from the repo root:
 
 ```sh
-docker build -t bufo-internal ./bufo
+docker build -t bufo-internal .
 docker run --rm --name bufo-internal \
   --read-only --cap-drop ALL --security-opt no-new-privileges \
-  --env-file bufo/.env \
+  --env-file .env \
   --mount type=volume,source=bufo-private-data,target=/data \
   --publish 127.0.0.1:4318:4318 bufo-internal
 ```
@@ -78,10 +77,9 @@ Start with one instance: the four-active-ranking limit and twelve-upstream-evalu
 
 ## Local preview
 
-Requires Node 22.13+ and the GitHub CLI, authenticated with read access to [the emoji source repo](https://github.com/github/slack-emoji/tree/main/emojis/_bufo). The runtime has no npm dependencies; no build, Slack token, or new hosting account is needed.
+Requires Node 22.13+ and the GitHub CLI, authenticated with read access to [the emoji source repo](https://github.com/github/slack-emoji/tree/main/emojis/_bufo). The runtime has no npm dependencies; no build, Slack token, or new hosting account is needed. Run these commands from the repo root:
 
 ```sh
-cd bufo
 cp .env.example .env
 # Set one approved model provider's key in .env.
 npm run sync
@@ -157,7 +155,7 @@ Exhaustive scoring can take several seconds and cost more than shortlisting. The
 
 The owner has confirmed that this Bufo collection may be publicly shared. Its exported snapshot is therefore included in the public Fly image and served without authentication. **Credentials are never public**, and no generated catalog, images, benchmark output, or screenshots are committed to the code repo. Only export artwork you are authorized to share.
 
-Local/shared sync output and downloaded images live in server storage (`BUFO_DATA_DIR`, default `bufo/.local/`). Those modes fetch images on demand, verify Git blob hashes, and cache with restricted file permissions. Public mode serves only its pre-exported snapshot from `BUFO_CATALOG_DIR`, while `BUFO_DATA_DIR` holds its persistent usage ledger. The MIME type comes from verified image bytes because some source filenames have misleading extensions.
+Local/shared sync output and downloaded images live in server storage (`BUFO_DATA_DIR`, default `.local/`). Those modes fetch images on demand, verify Git blob hashes, and cache with restricted file permissions. Public mode serves only its pre-exported snapshot from `BUFO_CATALOG_DIR`, while `BUFO_DATA_DIR` holds its persistent usage ledger. The MIME type comes from verified image bytes because some source filenames have misleading extensions.
 
 **Typing sends the message and emoji filenames to the selected model provider after a pause. Image bytes, GitHub credentials, image URLs, and blob hashes are not sent to the model.** A short disclosure stays below the textarea. Do not submit confidential messages or filenames to a provider that is not approved to receive them. TypeSafe says it does not train on requests; that is not a promise of zero retention. Vercel routes only to TypeSafe in this app, and no account-specific zero-retention entitlement is assumed.
 
