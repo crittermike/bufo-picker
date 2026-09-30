@@ -83,6 +83,31 @@ test('fresh viewers get automatic suggestions without keys, settings, or an opt-
   expect(await page.content()).not.toContain(TEST_KEY);
 });
 
+test('credits the creator with a keyboard-accessible footer that never overlaps results', async ({ page, app }) => {
+  await open(page, app);
+  const footer = page.getByRole('contentinfo');
+  const link = footer.getByRole('link', { name: '@crittermike on GitHub (opens in a new tab)', exact: true });
+  await expect(footer).toHaveText('made by @crittermike');
+  await expect(link).toHaveAttribute('href', 'https://github.com/crittermike');
+  await expect(link).toHaveAttribute('target', '_blank');
+  await expect(link).toHaveAttribute('rel', 'noopener noreferrer');
+  await link.focus();
+  await expect(link).toBeFocused();
+  expect(await link.evaluate(element => getComputedStyle(element).outlineStyle)).toBe('solid');
+  expect((await link.boundingBox()).height).toBeGreaterThanOrEqual(24);
+  for (const populated of [false, true]) {
+    if (populated) await suggest(page);
+    for (const width of [1280, 375, 320]) {
+      await page.setViewportSize({ width, height: 900 });
+      const main = await page.locator('main').boundingBox();
+      const credit = await footer.boundingBox();
+      expect(credit.y).toBeGreaterThanOrEqual(main.y + main.height - 1);
+      expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+      if (!populated) expect(credit.y + credit.height).toBeLessThanOrEqual(901);
+    }
+  }
+});
+
 test('debounces, scores every filename, caches repeats, and clears stale results', async ({ page, app }) => {
   await open(page, app);
   await pauseClock(page);
