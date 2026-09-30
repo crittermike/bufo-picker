@@ -136,6 +136,24 @@ A single 400-question request succeeded with 56,764 input tokens; 500 questions 
 
 All scores were still validated and every filename evaluated. Comparing old and new packing gave mean absolute score differences of 0.013-0.018 and 10-11 common top-twelve results; repeated runs of the same configuration varied by about 0.018 too. This is consistent with normal run-to-run variation, not proof of equal quality. The full experiment's returned usage totaled about 8.63 million tokens, or $0.36 at the published rate; failed/aborted work may add unreported charges. Raw responses remain in ignored private storage and are not sent to telemetry services.
 
+### Follow-up: would larger requests beat more of them?
+
+A later request asked whether raising the question cap to 400/request, with enough parallel requests to cover the whole catalog in one wave, would reduce total completion time (not just first-result time). Raising `MAX_QUESTIONS_PER_REQUEST` alone does not change real batch size: `packQuestions` rolls a batch over at whichever limit binds first, and at roughly 580 bytes per question the existing 60,000-byte cap binds before a 100-, 200-, or 400-question count cap ever would. Confirmed empirically: labeled 100x12, 400x5, 200x10, and 100x19 configurations all produced the same 19 real requests per ranking against the current 1,884-file catalog. Raising the byte cap to actually reach 400-question requests was rejected as unsafe per TypeSafe's 64k-token/32k-longest-question limits, and was not needed once the real bottleneck was identified.
+
+The real lever is `MAX_PARALLEL_REQUESTS`: total completion time is `ceil(realBatchCount / MAX_PARALLEL_REQUESTS)` waves. With 19 real batches and the old ceiling of 12, a ranking needed two waves. Benchmarks against the live Fly `iad` deployment (`bufo-picker.fly.dev`, Machine `e28655604b67d8`), using the real `jev.mjs`/`core.js` production code, the real 1,884-file catalog, and synthetic messages, confirm this:
+
+| Config (nominal questions x concurrency) | Real requests/ranking | Runs | Median | Mean | Min | Max |
+| --- | --- | --- | --- | --- | --- | --- |
+| 100 x 12 (old baseline) | 19 | 4 | 453 ms | 493 ms | 438 ms | 628 ms |
+| **100 x 19** (new, 1 wave) | 19 | 4 | **329 ms** | 331 ms | 298 ms | 366 ms |
+| 100 x 24 (plateau check) | 19 | 4 | 417 ms | 421 ms | 315 ms | 535 ms |
+| 200 x 10 | 19 | 4 | 498 ms | 513 ms | 485 ms | 570 ms |
+| 400 x 5 | 19 | 4 | 885 ms | 888 ms | 860 ms | 921 ms |
+
+All 20 runs succeeded (0 failures). Per-request token usage was nearly identical across every labeled config (~14,688-15,100 max input tokens, ~580 bytes/question), reconfirming that only the concurrency ceiling actually varied — not real request size. Raising concurrency to 19 (one wave for today's 19 real batches) was about 27% faster at the median than the old 12-concurrency baseline. Raising it further to 24 gave no additional benefit (417 ms, within noise/worse) since there are only 19 real batches to parallelize; concurrency beyond the real batch count is wasted. Larger nominal batch sizes with lower concurrency (200x10, 400x5) were both slower than the current small-batch/high-concurrency approach, confirming a single wave finishes only as fast as its slowest batch, and a larger individual request simply takes longer per batch without reducing wave count.
+
+**Updated setting: `MAX_PARALLEL_REQUESTS` raised from 12 to 20**, one more than the current catalog's exact 19-batch need, giving minimal headroom for catalog growth without unboundedly scaling the shared, cross-viewer concurrency pool. `MAX_QUESTIONS_PER_REQUEST` (100) and `MAX_REQUEST_BYTES` (60,000) are unchanged. This covers the current catalog in a single wave when capacity is available, but is not a guarantee across many simultaneous viewers or a substantially larger future catalog, since the pool remains shared and bounded. Existing byte-cap edge-case tests (`test/jev.test.mjs`) already use `Buffer.byteLength`-based bounds, not a chars/4 heuristic, and a new test confirms the current full catalog fits one concurrency wave under the raised ceiling.
+
 ## How filename ranking works
 
 1. Startup in shared mode, or the local sync command, reads the source's Git trees and canonical emoji mapping. Shared-mode source access uses the GitHub REST API with the server credential; local previews can use `gh`. It pins the child trees and image blobs to the same snapshot, resolves duplicate PNG/GIF versions using the canonical mapping, and writes a local index. Public mode serves the pre-exported snapshot instead. Canonically mapped multipart bufo sets outside `_bufo/` are included too, so large sets stored in other source directories are not missed.
