@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
-  buildScoringQuestions, evaluateQuestions, limitEvaluations,
-  MAX_NAME_BONUS, MAX_PARALLEL_REQUESTS, MAX_QUESTIONS_PER_REQUEST, MAX_REQUEST_BYTES, nameLengthBonus, packQuestions, parseEvaluation, rankWithJev,
+  buildScoringQuestions, evaluateQuestions, genericNamePenalty, limitEvaluations,
+  MAX_GENERIC_PENALTY, MAX_NAME_BONUS, MAX_PARALLEL_REQUESTS, MAX_QUESTIONS_PER_REQUEST, MAX_REQUEST_BYTES, nameLengthBonus, packQuestions, parseEvaluation, rankWithJev,
   validateConnection, validateText, verifyConnection
 } from '../jev.mjs';
 import { answerRequest, catalog, deferred, emoji, fakeFetch, flush, TEST_KEY } from './fixtures.mjs';
@@ -49,11 +49,11 @@ test('reports exact completed filename counts when parallel batches finish out o
   assert.deepEqual(progress.at(-1).ranking.suggestions, result.suggestions);
 });
 
-test('later scores replace the early favorite and mosaics wait for every tile before averaging', async () => {
+test('later specific matches replace a higher-scoring generic favorite and mosaics wait for every tile', async () => {
   const emojis = catalog(1200).emojis;
   emojis[0] = emoji(0, 'bufo-assembled_0_0');
-  emojis[1] = emoji(1, 'bufo-early-favorite');
-  emojis[1198] = emoji(1198, 'bufo-late-favorite');
+  emojis[1] = emoji(1, 'bufo-worried');
+  emojis[1198] = emoji(1198, 'bufo-watching-the-deploy-burn-while-pretending-everything-is-fine');
   emojis[1199] = emoji(1199, 'bufo-assembled_1_0');
   const partial = deferred();
   const release = deferred();
@@ -68,9 +68,10 @@ test('later scores replace the early favorite and mosaics wait for every tile be
       const request = JSON.parse(body);
       if (!Object.hasOwn(request.questions, 'e0')) await release.promise;
       return Response.json(answerRequest(request, filename => {
-        if (filename === emojis[0].filename || filename === emojis[1198].filename) return 0.99;
+        if (filename === emojis[0].filename) return 0.99;
+        if (filename === emojis[1198].filename) return 0.84;
         if (filename === emojis[1199].filename) return 0.21;
-        return filename === emojis[1].filename ? 0.8 : 0.1;
+        return filename === emojis[1].filename ? 0.93 : 0.1;
       }));
     }
   });
@@ -84,34 +85,97 @@ test('later scores replace the early favorite and mosaics wait for every tile be
   const mosaic = result.suggestions.find(match => match.id === emojis[0].id);
   assert.ok(Math.abs(mosaic.score - 0.6) < 1e-10);
   assert.equal(mosaic.nameBonus, nameLengthBonus('bufo-assembled', mosaic.score));
+  assert.equal(mosaic.genericPenalty, genericNamePenalty('bufo-assembled', mosaic.score));
   assert.deepEqual(updates.at(-1).ranking.suggestions, result.suggestions);
 });
 
-test('name bonuses grow gradually, exclude the common prefix, and stop at six points', () => {
-  assert.equal(nameLengthBonus('bufo-facepalm', 0.9), 0);
-  assert.equal(nameLengthBonus(`bufo-${'a'.repeat(24)}`, 0.9), MAX_NAME_BONUS / 2);
-  assert.equal(nameLengthBonus(`frog-${'a'.repeat(40)}`, 0.9), MAX_NAME_BONUS);
-  assert.equal(nameLengthBonus(`bufo-${'a'.repeat(200)}`, 0.9), MAX_NAME_BONUS);
-  assert.equal(nameLengthBonus(`bufo-${'a'.repeat(200)}`, 0.49), 0);
-  assert.equal(nameLengthBonus(`bufo-${'a'.repeat(200)}`, 0.5), MAX_NAME_BONUS);
+test('name bonuses are stronger and keep growing beyond forty characters with diminishing returns', () => {
+  const bonuses = [8, 9, 24, 40, 72, 120, 200].map(length =>
+    nameLengthBonus(`bufo-${'a'.repeat(length)}`, 0.9));
+  assert.equal(bonuses[0], 0);
+  assert.ok(Math.abs(bonuses[2] - 0.08) < 1e-10);
+  assert.equal(bonuses[3], 0.12);
+  assert.equal(bonuses[4], 0.16);
+  assert.ok(bonuses.every((bonus, index) => bonus < MAX_NAME_BONUS && (!index || bonus > bonuses[index - 1])));
+  assert.equal(MAX_NAME_BONUS, 0.24);
 });
 
-test('long names win close relevant matches but cannot override stronger relevance or rescue weak matches', async () => {
+test('name bonuses exclude common prefixes, count Unicode characters, and never boost weak matches', () => {
+  for (const prefix of ['', 'bufo-', 'bufo_', 'frog-', 'frog_', 'BUFO-', 'FROG_']) {
+    assert.equal(nameLengthBonus(`${prefix}facepalm`, 0.9), 0);
+    assert.equal(nameLengthBonus(`${prefix}${'a'.repeat(40)}`, 0.9), 0.12);
+  }
+  assert.equal(nameLengthBonus(`bufo-${'\u{1f438}'.repeat(8)}`, 0.9), 0);
+  assert.equal(nameLengthBonus(`bufo-${'a'.repeat(200)}`, 0.49), 0);
+  assert.equal(nameLengthBonus(`bufo-${'a'.repeat(200)}`, 0.5), nameLengthBonus(`bufo-${'a'.repeat(200)}`, 0.9));
+});
+
+test('generic penalties target single-word names, ignore numeric variants, and taper near the relevance threshold', () => {
+  for (const name of ['bufo-worried', 'bufo-concerned', 'bufo-nervous', 'frog_sad', 'FROG_WORRIED', 'worried', 'bufo-worried-2']) {
+    assert.equal(genericNamePenalty(name, 0.9), 0.1);
+    assert.ok(Math.abs(genericNamePenalty(name, 0.55) - 0.05) < 1e-10);
+    for (const score of [0, 0.49, 0.5]) assert.equal(genericNamePenalty(name, score), 0);
+  }
+  for (const name of ['bufo-oh-no', 'bufo_very_concerned', 'frog-concerned-about-the-deploy']) {
+    assert.equal(genericNamePenalty(name, 0.9), 0);
+  }
+  assert.equal(MAX_GENERIC_PENALTY, 0.1);
+});
+
+test('long names overcome larger relevance gaps but not much stronger matches and never rescue weak matches', async () => {
   const entries = [
-    emoji(0, 'bufo-happy'), emoji(1, `bufo-${'interesting-'.repeat(6)}`),
+    emoji(0, 'bufo-so-happy'), emoji(1, `bufo-${'interesting-'.repeat(6)}`),
     emoji(2, `bufo-${'unrelated-'.repeat(8)}`), emoji(3, 'bufo-wave')
   ];
-  for (const scores of [[0.83, 0.8, 0.1, 0.5], [0.9, 0.8, 0.1, 0.5], [0.5, 0.49, 0.1, 0.3]]) {
+  for (const scores of [[0.9, 0.8, 0.1, 0.5], [0.99, 0.65, 0.1, 0.5], [0.5, 0.49, 0.1, 0.3], [0.45, 0.44, 0.1, 0.3]]) {
     const result = await rankWithJev({
       text: 'Good news', emojis: entries, provider: 'typesafe', apiKey: TEST_KEY,
       fetchImpl: fakeFetch([], filename => scores[entries.findIndex(entry => entry.filename === filename)])
     });
-    const expected = scores[0] === 0.83 ? entries[1] : entries[0];
+    const expected = scores[0] === 0.9 ? entries[1] : entries[0];
     assert.equal(result.suggestions[0].id, expected.id);
     assert.equal(result.suggestions.at(-1).id, entries[2].id);
+    assert.equal(result.weakMatch, scores[0] < 0.5);
     const long = result.suggestions.find(match => match.id === entries[1].id);
     assert.equal(long.score, scores[1]);
-    assert.equal(long.nameBonus, scores[1] >= 0.5 ? MAX_NAME_BONUS : 0);
+    assert.equal(long.nameBonus, scores[1] >= 0.5 ? 0.16 : 0);
+    assert.equal(long.genericPenalty, 0);
+  }
+});
+
+test('generic emotions rank below similarly relevant specific names without being filtered out', async () => {
+  const entries = [
+    emoji(0, 'bufo-worried'), emoji(1, 'bufo-concerned'),
+    emoji(2, 'bufo-nervous'), emoji(3, 'bufo-oh-no')
+  ];
+  for (const provider of ['typesafe', 'vercel']) {
+    const result = await rankWithJev({
+      text: 'That deploy looks risky', emojis: entries, provider, apiKey: TEST_KEY,
+      fetchImpl: fakeFetch([], filename => filename === entries[3].filename ? 0.84 : 0.9)
+    });
+    assert.equal(result.suggestions[0].id, entries[3].id);
+    assert.equal(result.suggestions.length, entries.length);
+    for (const suggestion of result.suggestions) {
+      const specific = suggestion.id === entries[3].id;
+      assert.equal(suggestion.score, specific ? 0.84 : 0.9);
+      assert.equal(suggestion.genericPenalty, specific ? 0 : 0.1);
+    }
+    assert.equal(result.suggestions[0].nameBonus, 0);
+    assert.equal(result.weakMatch, false);
+  }
+});
+
+test('generic penalties cannot push relevant matches below weak matches or erase strong generic matches', async () => {
+  const entries = [emoji(0, 'bufo-worried'), emoji(1, 'bufo-a-very-specific-but-less-relevant-reaction')];
+  for (const scores of [[0.5, 0.49], [0.55, 0.49], [0.99, 0.6], [0.48, 0.47]]) {
+    const result = await rankWithJev({
+      text: 'Something is wrong', emojis: entries, provider: 'typesafe', apiKey: TEST_KEY,
+      fetchImpl: fakeFetch([], filename => scores[entries.findIndex(entry => entry.filename === filename)])
+    });
+    assert.equal(result.suggestions[0].id, entries[0].id);
+    assert.equal(result.suggestions[0].score, scores[0]);
+    assert.equal(result.weakMatch, scores[0] < 0.5);
+    assert.equal(result.suggestions[0].genericPenalty, genericNamePenalty(entries[0].name, scores[0]));
   }
 });
 
@@ -130,6 +194,7 @@ test('groups all tiles before the result limit and uses mean relevance with a bo
   assert.equal(result.suggestions.filter(match => tiles.some(tile => tile.id === match.id)).length, 1);
   assert.ok(Math.abs(result.suggestions[0].score - 0.9) < 1e-10);
   assert.equal(result.suggestions[0].nameBonus, nameLengthBonus('bufo-composite', 0.9));
+  assert.equal(result.suggestions[0].genericPenalty, MAX_GENERIC_PENALTY);
   const questions = requests.flatMap(request => Object.values(request.body.questions));
   assert.equal(questions.length, entries.length);
   assert.ok(questions.filter(question => question.instructions.composite).every(question =>
@@ -140,6 +205,7 @@ test('groups all tiles before the result limit and uses mean relevance with a bo
   });
   assert.ok(outlier.suggestions[0].score < 0.2);
   assert.equal(outlier.suggestions[0].nameBonus, 0);
+  assert.equal(outlier.suggestions[0].genericPenalty, 0);
   assert.equal(outlier.weakMatch, true);
 });
 

@@ -23,13 +23,24 @@ export const MAX_QUESTIONS_PER_REQUEST = 100;
 // or many simultaneous viewers sharing this pool. See README's benchmark section.
 export const MAX_PARALLEL_REQUESTS = 20;
 export const MAX_INPUT_TOKENS_PER_REQUEST = 65_536;
-export const MAX_NAME_BONUS = 0.06;
+export const MAX_NAME_BONUS = 0.24;
+export const MAX_GENERIC_PENALTY = 0.1;
 const MIN_RELEVANT_SCORE = 0.5;
+
+function descriptiveName(name) {
+  return name.replace(/^(?:bufo|frog)[-_]/i, '');
+}
 
 export function nameLengthBonus(name, score) {
   if (score < MIN_RELEVANT_SCORE) return 0;
-  const length = [...name.replace(/^(?:bufo|frog)[-_]/i, '')].length;
-  return MAX_NAME_BONUS * Math.min(1, Math.max(0, length - 8) / 32);
+  const extraLength = Math.max(0, [...descriptiveName(name)].length - 8);
+  return MAX_NAME_BONUS * extraLength / (extraLength + 32);
+}
+
+export function genericNamePenalty(name, score) {
+  const wordCount = descriptiveName(name).match(/\p{L}+/gu)?.length ?? 0;
+  if (wordCount > 1) return 0;
+  return Math.min(MAX_GENERIC_PENALTY, Math.max(0, score - MIN_RELEVANT_SCORE));
 }
 
 export class AppError extends Error {
@@ -243,7 +254,8 @@ function rankScoredEmojis(groups, scores) {
   const ranked = groups.filter(emoji => emoji.tiles.every(tile => scores.has(tile.id))).map(emoji => {
     const score = emoji.tiles.reduce((sum, tile) => sum + scores.get(tile.id), 0) / emoji.tiles.length;
     const nameBonus = nameLengthBonus(emoji.name, score);
-    return { emoji, score, nameBonus, rankingScore: score + nameBonus };
+    const genericPenalty = genericNamePenalty(emoji.name, score);
+    return { emoji, score, nameBonus, genericPenalty, rankingScore: score + nameBonus - genericPenalty };
   }).sort((a, b) => b.rankingScore - a.rankingScore || b.score - a.score || a.emoji.name.localeCompare(b.emoji.name));
   const seen = new Set();
   const suggestions = ranked.filter(({ emoji }) => {
@@ -253,7 +265,7 @@ function rankScoredEmojis(groups, scores) {
     if (seen.has(fingerprint)) return false;
     seen.add(fingerprint);
     return true;
-  }).slice(0, 12).map(({ emoji, score, nameBonus }) => ({ id: emoji.id, score, nameBonus }));
+  }).slice(0, 12).map(({ emoji, score, nameBonus, genericPenalty }) => ({ id: emoji.id, score, nameBonus, genericPenalty }));
   return { suggestions, weakMatch: !suggestions.length || suggestions[0].score < MIN_RELEVANT_SCORE };
 }
 
