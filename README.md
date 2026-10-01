@@ -4,11 +4,11 @@ A single-page emoji picker: type a message, pause for 700 ms, and Jev scores **e
 
 ## Public deployment on Fly
 
-Public URL: **https://bufo-picker.fly.dev**. No sign-in, viewer API key, or account setup is required. The owner has authorized public sharing of this emoji collection. The app still calls TypeSafe directly; using Fly for hosting does not require changing model providers.
+Public URL: **https://bufo-picker.fly.dev**. No sign-in, viewer API key, or account setup is required. The emoji collection comes exclusively from [knobiknows/all-the-bufo](https://github.com/knobiknows/all-the-bufo/tree/main/all-the-bufo), the public source selected by the owner. The app still calls TypeSafe directly; using Fly for hosting does not require changing model providers.
 
 `fly.toml` provisions one 512 MB `shared-cpu-1x` Machine in `iad`, with HTTPS, streaming responses, and a 1 GB encrypted volume. The Machine stays running to avoid cold starts. The runtime runs as the non-root `node` user. This is a small single-instance deployment, not a highly available service: deploys or hardware failure can cause downtime.
 
-The model key is a **Fly runtime secret**, never part of the image or browser code. The public image contains a pre-exported, verified emoji snapshot, so it needs **no GitHub credential** and makes no runtime GitHub requests. Local source access can still require GitHub authentication; that is separate from permission to publish the exported emoji artwork.
+The model key is a **Fly runtime secret**, never part of the image or browser code. The public image contains a pre-exported, verified emoji snapshot, so it needs **no GitHub credential** and makes no runtime GitHub requests. Sync and export use authenticated GitHub access for bulk downloads from the public source; no private emoji repo is accessed.
 
 Anonymous inference is deliberately bounded:
 
@@ -27,7 +27,9 @@ npm run export
 flyctl deploy --remote-only --depot=false --ha=false
 ```
 
-`export` verifies every image's bytes, size, and Git blob hash, then writes only `catalog.json` and `images/` under ignored `public-assets/`. It paces requests to avoid hammering the source. The `public` Docker target includes that directory; `.env`, `.local`, screenshots, and benchmark data remain excluded. A failed export must not be deployed. Exported images are read-only at runtime: a damaged or missing image fails explicitly rather than trying to fetch GitHub with an operator credential.
+`export` verifies every image's bytes, size, and Git blob hash, removes previously exported image files that are absent from the new catalog, then publishes `catalog.json` under ignored `public-assets/`. It paces requests to avoid hammering the source. Unexpected files in the export's `images/` directory cause an explicit error instead of being deleted. The `public` Docker target includes that directory; `.env`, `.local`, screenshots, and benchmark data remain excluded. A failed export must not be deployed. Exported images are read-only at runtime: a damaged or missing image fails explicitly rather than trying to fetch GitHub with an operator credential.
+
+**Migrating an older deployment:** catalogs from the previous source are rejected, including for cached images. Run all three commands above; changing the code or syncing locally does not replace a live Fly snapshot. Public-source image IDs are namespaced separately, so old image URLs stop resolving after redeploy. Only the public source's own bytes are used, even when an older collection has the same shortcode.
 
 For a new Fly app, change both `app` and `BUFO_PUBLIC_ORIGIN` in `fly.toml`, allocate shared public IPv4 and public IPv6 addresses with `flyctl ips allocate-v4 --shared` and `flyctl ips allocate-v6`, and create an encrypted `bufo_data` volume in the chosen region. Initialize that volume's mount point with owner UID/GID 1000 before starting the non-root app. Stage only `TYPESAFE_API_KEY` with `flyctl secrets import --stage` through standard input; do not put its value in command arguments or import unrelated local secrets. The existing `bufo-picker` app and volume are already provisioned. `/healthz` checks service readiness without running paid inference.
 
@@ -37,7 +39,7 @@ Public mode uses Fly Proxy's `Fly-Client-IP` when running on Fly, and the socket
 
 The app uses **one server-managed model credential**. Viewers open the internal URL, type a message, and click an emoji. There are no viewer API keys, provider settings, account-connection dialogs, or AI toggles. The interface is light-only.
 
-Shared mode is an alternative for collections that need restricted access; it is not used by the public Fly deployment. It needs an approved private host, a company-authenticated reverse proxy, an approved model account with credits, and narrow service access to the source repo. The public GitHub Pages site cannot run this backend.
+Shared mode restricts access to the app but uses the same public emoji source; it is not used by the public Fly deployment. It needs an approved private host, a company-authenticated reverse proxy, an approved model account with credits, and service access to the public source repo. The public GitHub Pages site cannot run this backend.
 
 Configure these once in the host's secret/config store:
 
@@ -46,7 +48,7 @@ Configure these once in the host's secret/config store:
 | `BUFO_MODE` | `shared` |
 | `BUFO_PUBLIC_ORIGIN` | Exact HTTPS origin, e.g. `https://bufo.internal.example`, with no path |
 | `BUFO_PROXY_SECRET` | Random secret of at least 32 characters, shared only with the authentication proxy |
-| `BUFO_GITHUB_TOKEN` | Approved service credential with read access to `github/slack-emoji`; never a viewer's token |
+| `BUFO_GITHUB_TOKEN` | Service credential for reading the public `knobiknows/all-the-bufo` repo; no private repo access is needed |
 | `JEV_PROVIDER` | `typesafe` (default) or `vercel` |
 | `TYPESAFE_API_KEY` | Central TypeSafe key; alternatively use `AI_GATEWAY_API_KEY` with `vercel` |
 | `BUFO_DATA_DIR` | Private writable cache directory; the container uses `/data` |
@@ -56,7 +58,7 @@ The reverse proxy is part of the required deployment, not implemented by this ap
 
 Forward `/api/suggest` response chunks promptly without buffering so live progress and best-so-far suggestions work. The server sends `X-Accel-Buffering: no` and `Cache-Control: no-store, no-transform`; the proxy must honor the streaming behavior.
 
-The server refuses incomplete shared configuration. Startup checks Jev access with a synthetic question and syncs the private catalog before opening the port. Invalid model access or source access prevents startup rather than producing a broken shared site. Secret renewal, source access, provider budgets, and identity/proxy configuration are operator responsibilities.
+The server refuses incomplete shared configuration. Startup checks Jev access with a synthetic question and syncs the public-source catalog before opening the port. Invalid model access or source access prevents startup rather than producing a broken shared site. Secret renewal, source access, provider budgets, and identity/proxy configuration are operator responsibilities.
 
 Build the source-only container from the repo root:
 
@@ -77,7 +79,7 @@ Start with one instance: the four-active-ranking limit and twelve-upstream-evalu
 
 ## Local preview
 
-Requires Node 22.13+ and the GitHub CLI, authenticated with read access to [the emoji source repo](https://github.com/github/slack-emoji/tree/main/emojis/_bufo). The runtime has no npm dependencies; no build, Slack token, or new hosting account is needed. Run these commands from the repo root:
+Requires Node 22.13+ and the GitHub CLI, authenticated for bulk access to [the public emoji source repo](https://github.com/knobiknows/all-the-bufo/tree/main/all-the-bufo). The runtime has no npm dependencies; no build, Slack token, or new hosting account is needed. Run these commands from the repo root:
 
 ```sh
 cp .env.example .env
@@ -138,7 +140,7 @@ All scores were still validated and every filename evaluated. Comparing old and 
 
 ## How filename ranking works
 
-1. Startup in shared mode, or the local sync command, reads the source's Git trees and canonical emoji mapping. Shared-mode source access uses the GitHub REST API with the server credential; local previews can use `gh`. It pins the child trees and image blobs to the same snapshot, resolves duplicate PNG/GIF versions using the canonical mapping, and writes a local index. Public mode serves the pre-exported snapshot instead. Canonically mapped multipart bufo sets outside `_bufo/` are included too, so large sets stored in other source directories are not missed.
+1. Startup in shared mode, or the local sync command, reads only `all-the-bufo/` in `knobiknows/all-the-bufo`. Shared-mode source access uses the GitHub REST API with the server credential; local previews can use `gh`. It pins the child tree and image blobs to the same snapshot and writes a local index. A same-directory GIF takes precedence over a PNG with the same shortcode; other ambiguous duplicates fail explicitly. Multipart bufo sets in that directory are included, but no sibling directories, private-source mappings, or fallback repos are consulted. Public mode serves the pre-exported snapshot instead.
 2. **Every filename gets its own Jev relevance question.** Each question asks whether that emoji would be a natural reaction to the meaning and feeling of the entire message. There is no keyword filter, local mood taxonomy, `Choice` competition, or shortlist. The 255-option `Choice` limit does not apply to these independent yes/no questions.
 3. Questions are packed into batches of at most 100, with a conservative 60 KB JSON cap and up to twelve evaluations in flight across viewers. Each batch receives the complete message as shared state. The live progress count advances only when a batch's answers have been received and validated, not when it is submitted. Best-so-far suggestions appear after each batch and reorder as more scores arrive. Every batch must finish for a completed ranking; failure clears provisional choices.
 4. The app combines tiled emojis, applies a small name-length preference, deduplicates complete image layouts, and shows up to twelve suggestions. Even an all-low-scoring result is shown with an explicit weak-match warning, not an unexplained "zero results." Scores are model judgments, not guarantees or image analysis; they are kept out of the minimal UI.
@@ -153,7 +155,7 @@ Exhaustive scoring can take several seconds and cost more than shortlisting. The
 
 ## Assets, credentials, and data flow
 
-The owner has confirmed that this Bufo collection may be publicly shared. Its exported snapshot is therefore included in the public Fly image and served without authentication. **Credentials are never public**, and no generated catalog, images, benchmark output, or screenshots are committed to the code repo. Only export artwork you are authorized to share.
+The owner selected [knobiknows/all-the-bufo](https://github.com/knobiknows/all-the-bufo) as the public collection. Only supported image files under its `all-the-bufo/` directory are eligible for syncing and export. The app no longer imports internal employee artwork from the previous source. Its exported snapshot is included in the public Fly image and served without authentication. **Credentials are never public**, and no generated catalog, images, benchmark output, or screenshots are committed to the code repo. Only export artwork you are authorized to share.
 
 Local/shared sync output and downloaded images live in server storage (`BUFO_DATA_DIR`, default `.local/`). Those modes fetch images on demand, verify Git blob hashes, and cache with restricted file permissions. Public mode serves only its pre-exported snapshot from `BUFO_CATALOG_DIR`, while `BUFO_DATA_DIR` holds its persistent usage ledger. The MIME type comes from verified image bytes because some source filenames have misleading extensions.
 
@@ -171,7 +173,7 @@ npm run check
 npm run sync
 ```
 
-Tests use synthetic filenames, images, and mocked provider responses. They cover exhaustive scoring, bounded name bonuses, mosaic grouping and multiline copying, live top-choice replacement, whole-mosaic scoring gates, image/focus preservation, out-of-order batch progress, interrupted streams, context limits, semantic results without keyword overlap, both provider protocols, debounce timing, stale responses, cancellation, provider cooldowns, asset export, read-only images, canonical duplicates, server credentials, shared-user isolation, global upstream concurrency, proxy authentication, public IP/CSRF limits, durable budget reservations, quota races/restarts, and light-only no-setup browser behavior. They do not prove live model quality, latency, or account access. Hosted startup checks the configured account; assess real suggestions before rolling out to colleagues.
+Tests use synthetic filenames, images, and mocked provider responses. They cover exhaustive scoring, bounded name bonuses, mosaic grouping and multiline copying, live top-choice replacement, whole-mosaic scoring gates, image/focus preservation, out-of-order batch progress, interrupted streams, context limits, semantic results without keyword overlap, both provider protocols, debounce timing, stale responses, cancellation, provider cooldowns, asset export, obsolete-image removal, read-only images, public-source boundaries, legacy-catalog rejection, GIF/PNG duplicates, server credentials, shared-user isolation, global upstream concurrency, proxy authentication, public IP/CSRF limits, durable budget reservations, quota races/restarts, and light-only no-setup browser behavior. They do not prove live model quality, latency, or account access. Hosted startup checks the configured account; assess real suggestions before rolling out to colleagues.
 
 Separate live TypeSafe checks on September 30, 2026 confirmed full-catalog rankings for "oops" and "payments are broken", with all twelve image previews loading for each. These are smoke checks, not a comprehensive quality benchmark or proof of an internal deployment.
 
@@ -179,13 +181,13 @@ Later checks exercised an expanded 1,884-filename snapshot, streamed scoring pro
 
 After tuning, two real browser runs completed server scoring in 0.5-0.7 seconds. Copyable choices appeared while scoring was still incomplete, 12-14 distinct top lists appeared, and the 16-tile mosaic still rendered and copied correctly. Desktop and mobile image loading and layout were checked without uploading private screenshots or touching the host clipboard.
 
-The public Fly image was built remotely and verified on September 30, 2026. Two public-browser rankings completed server scoring in 0.6-0.8 seconds, with live suggestions, correct image loading, and exact multiline copying. All 1,884 exported entries were validated inside the running non-root container without a GitHub key. An actual redeploy preserved the existing usage ledger. HTTPS redirection, denial of internal source/secret paths, required write tokens, and Fly's replacement of forged client-IP headers were also checked.
+Before the public-source migration, the Fly image was built remotely and verified on September 30, 2026. Two public-browser rankings completed server scoring in 0.6-0.8 seconds, with live suggestions, correct image loading, and exact multiline copying. All 1,884 entries in that earlier snapshot were validated inside the running non-root container without a GitHub key. An actual redeploy preserved the existing usage ledger. HTTPS redirection, denial of internal source/secret paths, required write tokens, and Fly's replacement of forged client-IP headers were also checked. The historical timing and cost experiments above used earlier collections, not the current public-source snapshot.
 
-Optional browser checks use Playwright with an installed Google Chrome and isolated test servers. They never use the private source catalog, call a real model, or overwrite the host clipboard:
+Optional browser checks use Playwright with an installed Google Chrome and isolated test servers. They never use a real source catalog, call a real model, or overwrite the host clipboard:
 
 ```sh
 npm ci
 npm run test:browser
 ```
 
-Re-run `npm run sync` to refresh a local/shared snapshot, then reload the app; shared startup also refreshes it. For Fly, follow it with `npm run export` and redeploy so the new immutable snapshot reaches the server. Old content-addressed cache files can be removed from the local cache's `images/` directory if no longer wanted. Rotate expiring service/model credentials in the host's secret store and restart the service. Never add `.local/`, `public-assets/`, or `.env` to a commit.
+Re-run `npm run sync` to refresh a local/shared snapshot, then reload the app; shared startup also refreshes it. For Fly, follow it with `npm run export` and redeploy so the new immutable snapshot reaches the server. Export removes obsolete generated image files automatically. Local cache files outside the current catalog are never served and can be removed from the cache's `images/` directory if no longer wanted. Rotate expiring service/model credentials in the host's secret store and restart the service. Never add `.local/`, `public-assets/`, or `.env` to a commit.
