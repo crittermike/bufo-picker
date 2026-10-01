@@ -189,6 +189,25 @@ test('packs one hundred questions per request without dropping or duplicating th
   assert.throws(() => packQuestions('Hello', { oversized: { type: 'noul', instructions: 'x'.repeat(MAX_REQUEST_BYTES) } }, 'typesafe'), { code: 'INPUT_TOO_LARGE' });
 });
 
+test('covers a full current-size catalog in a single concurrent wave, not just a single batch cap', async () => {
+  const emojis = catalog(1884).emojis;
+  const batches = packQuestions('Hello', buildScoringQuestions(emojis, 'typesafe'), 'typesafe');
+  assert.ok(batches.length <= MAX_PARALLEL_REQUESTS, `today's ${batches.length} real requests must fit within one wave (MAX_PARALLEL_REQUESTS=${MAX_PARALLEL_REQUESTS})`);
+  let active = 0;
+  let maximum = 0;
+  await rankWithJev({
+    text: 'Hello', emojis, provider: 'typesafe', apiKey: TEST_KEY,
+    fetchImpl: async (_url, { body }) => {
+      active += 1;
+      maximum = Math.max(maximum, active);
+      await new Promise(resolve => setTimeout(resolve, 1));
+      active -= 1;
+      return Response.json(answerRequest(JSON.parse(body)));
+    }
+  });
+  assert.equal(maximum, batches.length, 'every batch should fire in the same wave instead of queueing behind the concurrency ceiling');
+});
+
 test('bounds the actual serialized requests even with maximum-length names and Unicode messages', async () => {
   const emojis = Array.from({ length: 300 }, (_, index) => emoji(index, `bufo-${index}-${'x'.repeat(180)}`));
   const text = '\u4f60'.repeat(2000);

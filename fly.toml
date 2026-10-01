@@ -12,7 +12,7 @@ kill_timeout = 10
   BUFO_PUBLIC_ORIGIN = "https://bufo-picker.fly.dev"
   BUFO_DATA_DIR = "/data"
   BUFO_CATALOG_DIR = "/app/public-assets"
-  BUFO_DAILY_TOKEN_LIMIT = "25000000"
+  BUFO_DAILY_TOKEN_LIMIT = "119000000"
   JEV_PROVIDER = "typesafe"
   PORT = "4318"
 
