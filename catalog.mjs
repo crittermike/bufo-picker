@@ -1,13 +1,14 @@
 import { execFile } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdir, open, readFile, rename, unlink, writeFile } from 'node:fs/promises';
+import { mkdir, open, readFile, readdir, rename, unlink, writeFile } from 'node:fs/promises';
 import { dirname, extname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 import { setTimeout as delay } from 'node:timers/promises';
 import { AppError } from './jev.mjs';
 
-export const SOURCE_REPO = 'github/slack-emoji';
+export const SOURCE_REPO = 'knobiknows/all-the-bufo';
+const SOURCE_DIRECTORY = 'all-the-bufo';
 export const DATA_DIR = process.env.BUFO_DATA_DIR ? resolve(process.env.BUFO_DATA_DIR) : fileURLToPath(new URL('.local/', import.meta.url));
 const MAX_IMAGE_BYTES = 8_000_000;
 const TYPES = { png: 'image/png', gif: 'image/gif', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp' };
@@ -77,38 +78,37 @@ function assertTree(tree) {
   }
 }
 
-export function catalogFromTree(tree, canonicalPaths = {}, sourcePrefix = '_bufo/') {
+export function catalogFromTree(tree) {
   assertTree(tree);
   const blobs = tree.tree.filter(entry => entry.type === 'blob' && entry.mode !== '120000' && Object.hasOwn(TYPES, extname(entry.path).slice(1).toLowerCase()));
-  const pathNames = new Map(blobs.map(entry => [entry.path, entry.path.split('/').at(-1).slice(0, -extname(entry.path).length)]));
-  const occurrences = new Map();
-  for (const name of pathNames.values()) occurrences.set(name, (occurrences.get(name) || 0) + 1);
-  const names = new Set();
-  const emojis = blobs.flatMap(entry => {
-    const extension = extname(entry.path).slice(1).toLowerCase();
+  const variants = new Map();
+  for (const entry of blobs) {
     const filename = entry.path.split('/').at(-1);
-    const name = pathNames.get(entry.path);
-    if (occurrences.get(name) > 1 && canonicalPaths[name] !== `${sourcePrefix}${entry.path}`) return [];
-    if (!name || name.length > 200 || /[\x00-\x1f\x7f/:\\]/.test(name) || names.has(name) ||
+    const name = filename.slice(0, -extname(filename).length);
+    if (!name || name.length > 200 || /[\x00-\x1f\x7f/:\\]/.test(name) ||
         !/^[a-f0-9]{40}$/.test(entry.sha) || !Number.isSafeInteger(entry.size) ||
         entry.size < 1 || entry.size > MAX_IMAGE_BYTES) {
-      throw new AppError(503, 'The emoji tree contains an invalid or duplicate image entry.', 'INVALID_CATALOG');
+      throw new AppError(503, 'The emoji tree contains an invalid image entry.', 'INVALID_CATALOG');
     }
-    names.add(name);
-    // Preserve existing IDs while namespacing imports from other source directories.
-    const idPath = sourcePrefix === '_bufo/' ? entry.path : `canonical\0${sourcePrefix}${entry.path}`;
-    return [{
-      id: createHash('sha256').update(idPath).digest('hex').slice(0, 20),
-      name,
-      filename,
-      sha: entry.sha,
-      extension,
-      size: entry.size
-    }];
-  }).sort((a, b) => a.name.localeCompare(b.name));
-  if ([...occurrences].some(([name, count]) => count > 1 && !names.has(name))) {
-    throw new AppError(503, 'A duplicate emoji name is missing from the canonical source mapping.', 'INVALID_CATALOG');
+    if (!variants.has(name)) variants.set(name, []);
+    variants.get(name).push(entry);
   }
+  const emojis = [...variants].map(([name, entries]) => {
+    const gif = entries.find(entry => extname(entry.path).toLowerCase() === '.gif');
+    const png = entries.find(entry => extname(entry.path).toLowerCase() === '.png');
+    if (entries.length > 1 && (entries.length !== 2 || !gif || !png || dirname(gif.path) !== dirname(png.path))) {
+      throw new AppError(503, 'The emoji tree contains an ambiguous duplicate name.', 'INVALID_CATALOG');
+    }
+    const entry = gif || entries[0];
+    return {
+      id: createHash('sha256').update(`${SOURCE_REPO}\0${SOURCE_DIRECTORY}/${entry.path}`).digest('hex').slice(0, 20),
+      name,
+      filename: entry.path.split('/').at(-1),
+      sha: entry.sha,
+      extension: extname(entry.path).slice(1).toLowerCase(),
+      size: entry.size
+    };
+  }).sort((a, b) => a.name.localeCompare(b.name));
   if (!emojis.length) throw new AppError(503, 'No supported emoji images were found.', 'INVALID_CATALOG');
   return { version: 1, source: SOURCE_REPO, syncedAt: new Date().toISOString(), emojis };
 }
@@ -157,71 +157,13 @@ export async function atomicWrite(path, data, { durable = false } = {}) {
 }
 
 export async function syncCatalog({ dataDir = DATA_DIR, api = githubApi } = {}) {
-  let ref = 'main';
-  let mappingSha;
-  let emojiRoot;
-  for (const directory of ['emojis', '_bufo']) {
-    const tree = await api(`repos/${SOURCE_REPO}/git/trees/${ref}`);
-    assertTree(tree);
-    const child = tree.tree.find(entry => entry.path === directory && entry.type === 'tree');
-    if (directory === '_bufo') {
-      emojiRoot = tree;
-      mappingSha = tree.tree.find(entry => entry.path === 'emojis.json' && entry.type === 'blob')?.sha;
-    }
-    if (!child || !/^[a-f0-9]{40}$/.test(child.sha)) {
-      throw new AppError(503, 'The bufo source directory could not be found.', 'INVALID_CATALOG');
-    }
-    ref = child.sha;
+  const root = await api(`repos/${SOURCE_REPO}/git/trees/main`);
+  assertTree(root);
+  const child = root.tree.find(entry => entry.path === SOURCE_DIRECTORY && entry.type === 'tree');
+  if (!child || !/^[a-f0-9]{40}$/.test(child.sha)) {
+    throw new AppError(503, 'The public bufo source directory could not be found.', 'INVALID_CATALOG');
   }
-  if (!mappingSha || !/^[a-f0-9]{40}$/.test(mappingSha)) {
-    throw new AppError(503, 'The canonical emoji mapping is missing from the source.', 'INVALID_CATALOG');
-  }
-  let canonicalPaths;
-  try {
-    canonicalPaths = JSON.parse((await api(`repos/${SOURCE_REPO}/git/blobs/${mappingSha}`, true)).toString('utf8'));
-  } catch (error) {
-    if (error instanceof AppError) throw error;
-    throw new AppError(503, 'The canonical emoji mapping is unreadable.', 'INVALID_CATALOG');
-  }
-  if (!canonicalPaths || typeof canonicalPaths !== 'object' || Array.isArray(canonicalPaths)) {
-    throw new AppError(503, 'The canonical emoji mapping is invalid.', 'INVALID_CATALOG');
-  }
-  const catalog = catalogFromTree(await api(`repos/${SOURCE_REPO}/git/trees/${ref}?recursive=1`), canonicalPaths);
-  const extraPaths = new Set();
-  for (const [name, path] of Object.entries(canonicalPaths)) {
-    if (!/bufo.*_\d+_\d+$/i.test(name)) continue;
-    if (typeof path !== 'string' || /[\\\x00-\x1f\x7f]/.test(path) ||
-        path.split('/').some(part => !part || part === '.' || part === '..') ||
-        path.split('/').at(-1) !== `${name}${extname(path)}`) {
-      throw new AppError(503, 'A multipart emoji has an invalid canonical path.', 'INVALID_CATALOG');
-    }
-    if (!path.startsWith('_bufo/')) extraPaths.add(path);
-  }
-  if (extraPaths.size) {
-    const directories = new Set([...extraPaths].map(path => path.includes('/') ? path.split('/')[0] : ''));
-    const blobs = [];
-    for (const directory of directories) {
-      let tree = emojiRoot;
-      if (directory) {
-        const child = emojiRoot.tree.find(entry => entry.path === directory && entry.type === 'tree');
-        if (!child || !/^[a-f0-9]{40}$/.test(child.sha)) {
-          throw new AppError(503, 'A multipart emoji source directory is missing.', 'INVALID_CATALOG');
-        }
-        tree = await api(`repos/${SOURCE_REPO}/git/trees/${child.sha}?recursive=1`);
-        assertTree(tree);
-      }
-      for (const entry of tree.tree) {
-        const path = directory ? `${directory}/${entry.path}` : entry.path;
-        if (extraPaths.has(path)) blobs.push({ ...entry, path });
-      }
-    }
-    const extra = catalogFromTree({ truncated: false, tree: blobs }, canonicalPaths, '');
-    if (extra.emojis.length !== extraPaths.size) {
-      throw new AppError(503, 'A multipart emoji is missing from its canonical source directory.', 'INVALID_CATALOG');
-    }
-    catalog.emojis = [...new Map([...catalog.emojis, ...extra.emojis].map(emoji => [emoji.name, emoji])).values()]
-      .sort((a, b) => a.name.localeCompare(b.name));
-  }
+  const catalog = catalogFromTree(await api(`repos/${SOURCE_REPO}/git/trees/${child.sha}?recursive=1`));
   validateCatalog(catalog);
   await atomicWrite(join(dataDir, 'catalog.json'), `${JSON.stringify(catalog)}\n`);
   return catalog;
@@ -237,7 +179,7 @@ export function imageType(bytes) {
 
 function validImage(bytes, entry) {
   const sha = createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex');
-  // Some canonical .png filenames contain WebP images.
+  // Some source .png filenames contain WebP images.
   return bytes.length === entry.size && sha === entry.sha && imageType(bytes) !== null;
 }
 
@@ -339,6 +281,14 @@ export async function exportCatalog({
       throw error;
     }
   }));
+  const imageNames = new Set(catalog.emojis.map(entry => `${entry.sha}.${entry.extension}`));
+  for (const filename of await readdir(join(outputDir, 'images'))) {
+    if (imageNames.has(filename)) continue;
+    if (!/^[a-f0-9]{40}\.(png|gif|jpg|jpeg|webp)$/.test(filename)) {
+      throw new AppError(503, 'The export contains an unexpected image file. Use a clean output directory.', 'INVALID_IMAGE');
+    }
+    await unlink(join(outputDir, 'images', filename));
+  }
   await atomicWrite(join(outputDir, 'catalog.json'), `${JSON.stringify(catalog)}\n`);
   return catalog;
 }

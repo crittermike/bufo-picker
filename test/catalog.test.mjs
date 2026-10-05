@@ -39,6 +39,50 @@ test('public exports contain only the catalog and verified image files', async t
   assert.equal(calls, 0);
 });
 
+test('export replaces a legacy snapshot and removes images outside the new catalog', async t => {
+  const outputDir = await temporary(t);
+  const old = { ...catalog(2), source: 'github/slack-emoji' };
+  await mkdir(join(outputDir, 'images'));
+  await writeFile(join(outputDir, 'catalog.json'), JSON.stringify(old));
+  for (const entry of old.emojis) {
+    await writeFile(join(outputDir, 'images', `${entry.sha}.${entry.extension}`), imageBytes(Number.parseInt(entry.id, 16)));
+  }
+  const value = { ...catalog(1), emojis: [emoji(9, 'bufo-public')] };
+  await exportCatalog({
+    outputDir, intervalMs: 0,
+    store: { get: async () => value, image: async () => ({ bytes: imageBytes(9) }) }
+  });
+  assert.deepEqual(await readdir(join(outputDir, 'images')), [`${value.emojis[0].sha}.png`]);
+  assert.deepEqual(JSON.parse(await readFile(join(outputDir, 'catalog.json'), 'utf8')), value);
+  const store = createCatalogStore({ dataDir: outputDir, readOnly: true });
+  assert.deepEqual((await store.image(value.emojis[0].id)).bytes, imageBytes(9));
+  await assert.rejects(store.image(old.emojis[0].id), { code: 'NOT_FOUND' });
+});
+
+test('export refuses legacy catalogs before reading or publishing any images', async t => {
+  const outputDir = await temporary(t);
+  await assert.rejects(exportCatalog({
+    outputDir, intervalMs: 0,
+    store: {
+      get: async () => ({ ...catalog(1), source: 'github/slack-emoji' }),
+      image: async () => assert.fail('Legacy images must never be exported')
+    }
+  }), { code: 'INVALID_CATALOG' });
+  assert.deepEqual(await readdir(outputDir), []);
+});
+
+test('export fails explicitly on unexpected files instead of deleting unrelated data', async t => {
+  const outputDir = await temporary(t);
+  await mkdir(join(outputDir, 'images'));
+  await writeFile(join(outputDir, 'images', 'notes.txt'), 'keep this file');
+  await assert.rejects(exportCatalog({
+    outputDir, intervalMs: 0,
+    store: { get: async () => catalog(1), image: async () => ({ bytes: imageBytes(0) }) }
+  }), { code: 'INVALID_IMAGE' });
+  assert.equal(await readFile(join(outputDir, 'images', 'notes.txt'), 'utf8'), 'keep this file');
+  await assert.rejects(readFile(join(outputDir, 'catalog.json')), { code: 'ENOENT' });
+});
+
 test('failed export does not publish a new catalog and read-only images never download or self-repair', async t => {
   const outputDir = await temporary(t);
   const value = catalog(1);
@@ -59,98 +103,73 @@ test('failed export does not publish a new catalog and read-only images never do
   assert.equal(calls, 0);
 });
 
-test('sync follows pinned subtrees and uses the canonical map for duplicate file extensions', async t => {
+test('sync imports only the pinned public directory, including multipart images and GIF variants', async t => {
   const dataDir = await temporary(t);
   const calls = [];
-  const emojisTree = 'a'.repeat(40);
   const bufoTree = 'b'.repeat(40);
-  const mappingBlob = 'c'.repeat(40);
   const result = await syncCatalog({
     dataDir,
     api: async (path, raw) => {
       calls.push({ path, raw });
-      if (path.endsWith('/main')) return { truncated: false, tree: [{ type: 'tree', path: 'emojis', sha: emojisTree }] };
-      if (path.endsWith(`/${emojisTree}`)) return {
+      if (path === 'repos/knobiknows/all-the-bufo/git/trees/main') return {
         truncated: false,
-        tree: [{ type: 'tree', path: '_bufo', sha: bufoTree }, { type: 'blob', path: 'emojis.json', sha: mappingBlob }]
+        tree: [
+          { type: 'tree', path: 'all-the-bufo', sha: bufoTree },
+          { type: 'tree', path: 'other-images', sha: 'c'.repeat(40) },
+          treeEntry(99, 'outside-the-collection')
+        ]
       };
-      if (path.endsWith(`/${mappingBlob}`)) return Buffer.from(JSON.stringify({ 'bufo-party': '_bufo/bufo-party.gif' }));
-      if (path.endsWith(`/${bufoTree}?recursive=1`)) return {
+      if (path === `repos/knobiknows/all-the-bufo/git/trees/${bufoTree}?recursive=1`) return {
         truncated: false,
-        tree: [treeEntry(1, 'bufo-party'), { ...treeEntry(2, 'bufo-party'), path: 'bufo-party.gif' }, treeEntry(3, 'bufo-coffee')]
+        tree: [
+          treeEntry(1, 'bufo-party'), { ...treeEntry(2, 'bufo-party'), path: 'bufo-party.gif' },
+          treeEntry(3, 'bufo-coffee'), treeEntry(4, 'bigbufo_0_0'), treeEntry(5, 'bigbufo_1_0')
+        ]
       };
       assert.fail(`Unexpected path ${path}`);
     }
   });
-  assert.equal(result.emojis.length, 2);
+  assert.equal(result.source, 'knobiknows/all-the-bufo');
+  assert.deepEqual(result.emojis.map(entry => entry.name), ['bigbufo_0_0', 'bigbufo_1_0', 'bufo-coffee', 'bufo-party']);
   assert.equal(result.emojis.find(entry => entry.name === 'bufo-party').filename, 'bufo-party.gif');
-  assert.equal(calls.length, 4);
-  assert.equal(calls.filter(call => call.raw).length, 1);
+  assert.equal(calls.length, 2);
+  assert.equal(calls.filter(call => call.raw).length, 0);
   assert.deepEqual(JSON.parse(await readFile(join(dataDir, 'catalog.json'), 'utf8')), result);
   assert.equal((await stat(join(dataDir, 'catalog.json'))).mode & 0o077, 0);
 });
 
-test('sync imports canonical multipart bufos from other pinned directories without changing existing IDs', async t => {
-  const dataDir = await temporary(t);
-  const calls = [];
-  const emojisTree = 'a'.repeat(40), bufoTree = 'b'.repeat(40), mappingBlob = 'c'.repeat(40), otherTree = 'd'.repeat(40);
-  const original = treeEntry(0, 'bufo-existing');
-  const result = await syncCatalog({
-    dataDir,
-    api: async path => {
-      calls.push(path);
-      if (path.endsWith('/main')) return { truncated: false, tree: [{ type: 'tree', path: 'emojis', sha: emojisTree }] };
-      if (path.endsWith(`/${emojisTree}`)) return {
-        truncated: false,
-        tree: [
-          { type: 'tree', path: '_bufo', sha: bufoTree },
-          { type: 'tree', path: 'b', sha: otherTree },
-          { type: 'blob', path: 'emojis.json', sha: mappingBlob }
-        ]
-      };
-      if (path.endsWith(`/${mappingBlob}`)) return Buffer.from(JSON.stringify({
-        bigbufo_0_0: 'b/bigbufo_0_0.png', bigbufo_1_0: 'b/bigbufo_1_0.png',
-        unrelated_0_0: 'b/unrelated_0_0.png'
-      }));
-      if (path.endsWith(`/${bufoTree}?recursive=1`)) return {
-        truncated: false, tree: [original, treeEntry(99, 'bigbufo_0_0')]
-      };
-      if (path.endsWith(`/${otherTree}?recursive=1`)) return {
-        truncated: false, tree: [treeEntry(1, 'bigbufo_0_0'), treeEntry(2, 'bigbufo_1_0'), treeEntry(3, 'unrelated_0_0')]
-      };
-      assert.fail(`Unexpected source request ${path}`);
-    }
-  });
-  assert.equal(calls.length, 5);
-  assert.equal(result.emojis.length, 3);
-  assert.equal(result.emojis.find(entry => entry.name === 'bigbufo_0_0').sha, emoji(1).sha);
-  assert.equal(result.emojis.find(entry => entry.name === original.path.slice(0, -4)).id,
-    catalogFromTree({ truncated: false, tree: [original] }).emojis[0].id);
-  assert.ok(result.emojis.every(entry => !entry.name.startsWith('unrelated')));
-  assert.equal(new Set(result.emojis.map(entry => entry.id)).size, 3);
+test('public image IDs are stable and cannot reuse legacy source URLs', () => {
+  const tree = [treeEntry(0), treeEntry(1)];
+  const first = catalogFromTree({ truncated: false, tree }).emojis;
+  const reordered = catalogFromTree({ truncated: false, tree: [...tree].reverse() }).emojis;
+  assert.deepEqual(first, reordered);
+  assert.equal(new Set(first.map(entry => entry.id)).size, 2);
+  for (const entry of first) {
+    const legacyId = createHash('sha256').update(entry.filename).digest('hex').slice(0, 20);
+    assert.notEqual(entry.id, legacyId);
+  }
 });
 
-test('missing or unsafe canonical multipart paths never produce a partially updated catalog', async t => {
+test('missing, incomplete, or ambiguous public trees never overwrite the local catalog', async t => {
   const dataDir = await temporary(t);
   const before = JSON.stringify(catalog(1));
   await writeFile(join(dataDir, 'catalog.json'), before);
-  const emojisTree = 'a'.repeat(40), bufoTree = 'b'.repeat(40), mappingBlob = 'c'.repeat(40), otherTree = 'd'.repeat(40);
-  for (const path of ['../b/bigbufo_1_0.png', 'b/bigbufo_1_0.png']) {
+  const bufoTree = 'b'.repeat(40);
+  const root = { truncated: false, tree: [{ type: 'tree', path: 'all-the-bufo', sha: bufoTree }] };
+  const images = { truncated: false, tree: [treeEntry(0)] };
+  for (const [rootResponse, imageResponse] of [
+    [{ ...root, truncated: true }, images],
+    [{ truncated: false, tree: [] }, images],
+    [{ truncated: false, tree: [{ ...root.tree[0], sha: 'invalid' }] }, images],
+    [root, { ...images, truncated: true }],
+    [root, { truncated: false, tree: [] }],
+    [root, { truncated: false, tree: [treeEntry(0), treeEntry(0)] }]
+  ]) {
     await assert.rejects(syncCatalog({
       dataDir,
       api: async endpoint => {
-        if (endpoint.endsWith('/main')) return { truncated: false, tree: [{ type: 'tree', path: 'emojis', sha: emojisTree }] };
-        if (endpoint.endsWith(`/${emojisTree}`)) return {
-          truncated: false, tree: [
-            { type: 'tree', path: '_bufo', sha: bufoTree }, { type: 'tree', path: 'b', sha: otherTree },
-            { type: 'blob', path: 'emojis.json', sha: mappingBlob }
-          ]
-        };
-        if (endpoint.endsWith(`/${mappingBlob}`)) return Buffer.from(JSON.stringify({
-          bigbufo_0_0: 'b/bigbufo_0_0.png', bigbufo_1_0: path
-        }));
-        if (endpoint.endsWith(`/${bufoTree}?recursive=1`)) return { truncated: false, tree: [treeEntry(0)] };
-        if (endpoint.endsWith(`/${otherTree}?recursive=1`)) return { truncated: false, tree: [treeEntry(1, 'bigbufo_0_0')] };
+        if (endpoint === `repos/${SOURCE_REPO}/git/trees/main`) return rootResponse;
+        if (endpoint === `repos/${SOURCE_REPO}/git/trees/${bufoTree}?recursive=1`) return imageResponse;
         assert.fail(`Unexpected source request ${endpoint}`);
       }
     }), { code: 'INVALID_CATALOG' });
@@ -161,7 +180,26 @@ test('missing or unsafe canonical multipart paths never produce a partially upda
 test('rejects truncated trees, ambiguous duplicate names, and empty catalogs', () => {
   assert.throws(() => catalogFromTree({ truncated: true, tree: [treeEntry(0)] }), { code: 'INVALID_CATALOG' });
   assert.throws(() => catalogFromTree({ truncated: false, tree: [] }), { code: 'INVALID_CATALOG' });
-  assert.throws(() => catalogFromTree({ truncated: false, tree: [treeEntry(0), { ...treeEntry(0), path: 'bufo-example-0.gif' }] }), { code: 'INVALID_CATALOG' });
+  for (const tree of [
+    [treeEntry(0), treeEntry(0)],
+    [treeEntry(0), { ...treeEntry(1), path: 'bufo-example-0.jpg' }],
+    [treeEntry(0), { ...treeEntry(1), path: 'nested/bufo-example-0.gif' }],
+    [treeEntry(0), { ...treeEntry(1), path: 'bufo-example-0.gif' }, treeEntry(0)]
+  ]) {
+    assert.throws(() => catalogFromTree({ truncated: false, tree }), { code: 'INVALID_CATALOG' });
+  }
+});
+
+test('GIF takes precedence over a same-name PNG regardless of tree order', () => {
+  const png = treeEntry(0, 'bufo-football');
+  const gif = { ...treeEntry(1, 'bufo-football'), path: 'bufo-football.gif' };
+  for (const tree of [[png, gif], [gif, png]]) {
+    const result = catalogFromTree({ truncated: false, tree });
+    assert.equal(result.emojis.length, 1);
+    assert.equal(result.emojis[0].filename, gif.path);
+    assert.equal(result.emojis[0].sha, gif.sha);
+    assert.equal(result.emojis[0].extension, 'gif');
+  }
 });
 
 test('accepts punctuation in actual filenames but rejects control characters and unsupported assets', () => {
@@ -195,6 +233,21 @@ test('missing and malformed catalogs give actionable errors', async t => {
   await assert.rejects(store.get(), { code: 'CATALOG_MISSING' });
   await writeFile(join(dataDir, 'catalog.json'), 'not JSON');
   await assert.rejects(store.get(), { code: 'INVALID_CATALOG' });
+});
+
+test('local and public stores reject legacy catalogs even when their image bytes are cached', async t => {
+  const dataDir = await temporary(t);
+  const value = { ...catalog(1), source: 'github/slack-emoji' };
+  await writeFile(join(dataDir, 'catalog.json'), JSON.stringify(value));
+  await mkdir(join(dataDir, 'images'));
+  await writeFile(join(dataDir, 'images', `${value.emojis[0].sha}.png`), imageBytes(0));
+  for (const readOnly of [false, true]) {
+    const store = createCatalogStore({
+      dataDir, readOnly, api: async () => assert.fail('Legacy catalogs must never fetch images')
+    });
+    await assert.rejects(store.get(), { code: 'INVALID_CATALOG' });
+    await assert.rejects(store.image(value.emojis[0].id), { code: 'INVALID_CATALOG' });
+  }
 });
 
 test('downloads images once on demand, verifies Git blob hashes, and caches privately', async t => {
@@ -233,7 +286,7 @@ test('does not accept non-image bytes or a mismatched image hash', async t => {
   assert.equal(imageType(Buffer.from('<svg>')), null);
 });
 
-test('serves the verified image MIME type even when the canonical filename has a different extension', async t => {
+test('serves the verified image MIME type even when the source filename has a different extension', async t => {
   const dataDir = await temporary(t);
   const bytes = Buffer.from('RIFF1234WEBP');
   const value = catalog(1);
@@ -283,6 +336,8 @@ test('hosted GitHub access authenticates on the server and supports JSON and raw
   assert.equal(calls[0].options.redirect, 'error');
   await assert.rejects(api('https://untrusted.invalid/token'), { code: 'INVALID_SOURCE' });
   await assert.rejects(api('repos/another/repo/git/trees/main'), { code: 'INVALID_SOURCE' });
+  await assert.rejects(api('repos/github/slack-emoji/git/trees/main'), { code: 'INVALID_SOURCE' });
+  await assert.rejects(api(`repos/github/slack-emoji/git/blobs/${emoji(0).sha}`, true), { code: 'INVALID_SOURCE' });
   assert.equal(calls.length, 2);
 });
 

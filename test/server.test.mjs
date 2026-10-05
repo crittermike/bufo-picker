@@ -1,14 +1,14 @@
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import { request as httpRequest } from 'node:http';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { readSuggestionStream } from '../core.js';
 import { AppError, MAX_INPUT_TOKENS_PER_REQUEST } from '../jev.mjs';
 import { createBufoServer } from '../server.mjs';
-import { answerRequest, catalog, deferred, fakeFetch, flush, imageBytes, TEST_KEY } from './fixtures.mjs';
+import { answerRequest, catalog, deferred, emoji, fakeFetch, flush, imageBytes, TEST_KEY } from './fixtures.mjs';
 
 const SHARED_ENV = {
   TYPESAFE_API_KEY: TEST_KEY, BUFO_MODE: 'shared',
@@ -97,6 +97,33 @@ test('public visitors can load the app, catalog, images, and streamed suggestion
   assert.equal(updates.at(-1).ranking.suggestions.length, 12);
   assert.equal(JSON.stringify(app.info).includes(TEST_KEY), false);
   assert.equal(app.env.BUFO_GITHUB_TOKEN, undefined);
+});
+
+test('public startup rejects legacy snapshots and removed images stay inaccessible even if cached', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'bufo-migration-test-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const env = { ...PUBLIC_ENV, BUFO_DATA_DIR: directory, BUFO_CATALOG_DIR: directory };
+  const old = { ...catalog(1), source: 'github/slack-emoji' };
+  await writeFile(join(directory, 'catalog.json'), JSON.stringify(old));
+  await assert.rejects(createBufoServer({ env }), { code: 'INVALID_CATALOG' });
+
+  const value = { ...catalog(1), emojis: [emoji(1, 'bufo-public')] };
+  await writeFile(join(directory, 'catalog.json'), JSON.stringify(value));
+  await mkdir(join(directory, 'images'));
+  for (const entry of [...old.emojis, ...value.emojis]) {
+    await writeFile(join(directory, 'images', `${entry.sha}.png`), imageBytes(Number.parseInt(entry.id, 16)));
+  }
+  const app = await start(t, { env, catalogStore: undefined });
+  const headers = publicHeaders('192.0.2.1');
+  const list = (await raw(app.origin, '/api/catalog', { headers })).json();
+  assert.deepEqual(list.emojis, value.emojis.map(({ id, name }) => ({ id, name })));
+  assert.equal((await raw(app.origin, `/api/emoji/${value.emojis[0].id}`, { headers })).status, 200);
+  const removed = await raw(app.origin, `/api/emoji/${old.emojis[0].id}`, { headers });
+  assert.equal(removed.status, 404);
+  assert.equal(removed.json().code, 'NOT_FOUND');
+  assert.equal(removed.headers['cache-control'], 'no-store');
+  assert.equal((await raw(app.origin, `/public-assets/images/${old.emojis[0].sha}.png`, { headers })).status, 404);
+  assert.equal(app.requests.length, 0);
 });
 
 test('public writes still require the exact origin and that network client CSRF token', async t => {
