@@ -16,7 +16,12 @@ export const PROVIDERS = {
 };
 export const MAX_REQUEST_BYTES = 60_000;
 export const MAX_QUESTIONS_PER_REQUEST = 100;
-export const MAX_PARALLEL_REQUESTS = 12;
+// Real batches are capped by MAX_REQUEST_BYTES well before MAX_QUESTIONS_PER_REQUEST
+// (~100-106 questions/request today), so the current 1,884-file catalog packs into
+// ~19 requests. 20 lets one ranking's full wave fire in parallel with one spare of
+// headroom for catalog growth, without unbounded scaling for future larger catalogs
+// or many simultaneous viewers sharing this pool. See README's benchmark section.
+export const MAX_PARALLEL_REQUESTS = 20;
 export const MAX_INPUT_TOKENS_PER_REQUEST = 65_536;
 export const MAX_NAME_BONUS = 0.06;
 const MIN_RELEVANT_SCORE = 0.5;

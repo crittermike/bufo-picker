@@ -47,6 +47,18 @@ test('restart preserves reservations from failed, cancelled, or unfinished work'
   await assert.rejects(restarted.reserve(31), { code: 'DAILY_BUDGET' });
 });
 
+test('raising the configured allowance preserves usage and keeps the new limit bounded', async t => {
+  const { budget, options, state } = await fixture(t);
+  await budget.reserve(80);
+  await assert.rejects(budget.reserve(21), { code: 'DAILY_BUDGET' });
+  const increased = createUsageBudget({ ...options, tokenLimit: 200 });
+  await increased.ready();
+  assert.equal((await state()).usedTokens, 80);
+  await increased.reserve(100);
+  assert.equal((await state()).usedTokens, 180);
+  await assert.rejects(increased.reserve(21), { code: 'DAILY_BUDGET' });
+});
+
 test('invalid or duplicate settlements never create extra budget', async t => {
   const { budget, state } = await fixture(t);
   const settle = await budget.reserve(80);

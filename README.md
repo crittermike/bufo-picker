@@ -12,12 +12,12 @@ The model key is a **Fly runtime secret**, never part of the image or browser co
 
 Anonymous inference is deliberately bounded:
 
-- Ten searches per minute per client IP, one active search per client, four active searches overall, and twelve upstream evaluations in flight.
-- A persistent **25,000,000-input-token budget per UTC day**, about **$1.05 at the current TypeSafe price**, excluding startup connection checks and hosting. This normally covers about ninety short-message rankings, with fewer possible after failures or cancellations.
+- Ten searches per minute per client IP, one active search per client, four active searches overall, and twenty upstream evaluations in flight.
+- A persistent **119,000,000-input-token budget per UTC day**, about **$5 at the current TypeSafe price**, excluding startup connection checks and hosting. This normally covers roughly 440 short-message rankings, with fewer possible after failures or cancellations.
 - Before paid inference, reserve 65,536 tokens for every planned provider request, conservatively covering Jev's documented 64k request ceiling. Successful requests release the difference from reported usage. Failures, cancellations, and missing usage retain the full reservation. Searches are charged to the UTC day on which they start.
 - The aggregate ledger lives at `/data/usage.json`, is serialized and synced to disk before paid work, and survives restarts. Invalid or unavailable storage fails closed. No messages or client IPs are written to this ledger.
 
-These are app-level limits, not a provider billing guarantee. Other apps using the same key, changing model prices/limits, or adding replicas can change total spending. Keep this deployment at **one Machine**, preserve its volume, and use account-level spending controls where available. Do not delete the ledger to recover from a quota error; it resets at midnight UTC. Changing `BUFO_DAILY_TOKEN_LIMIT` in `fly.toml` changes the allowance after redeploy.
+These are app-level limits, not a provider billing guarantee. The `DAILY_BUDGET` error means this app's allowance is exhausted, not that TypeSafe credits are unavailable; buying provider credits alone will not change it. Other apps using the same key, changing model prices/limits, or adding replicas can change total spending. Keep this deployment at **one Machine**, preserve its volume, and use account-level spending controls where available. Do not delete the ledger to recover from a quota error; it resets at midnight UTC. Changing `BUFO_DAILY_TOKEN_LIMIT` in `fly.toml` changes the allowance after redeploy without clearing existing usage. Reload a browser tab showing the old quota error to clear its cached retry cooldown.
 
 To refresh the snapshot and redeploy, run from the repo root with Fly and source access:
 
@@ -135,6 +135,33 @@ These are small, interleaved samples on one account, not a load test or latency 
 A single 400-question request succeeded with 56,764 input tokens; 500 questions failed with `max_tokens_exceeded`. These counts depend on prompt and filename lengths, not an API question-count limit. The selected 100-question requests used about 14k tokens at most in the short-message experiments. Across a full ranking, they used 268,266-268,456 input tokens, about $0.0113 at the published rate, versus about $0.0116 for the old packing.
 
 All scores were still validated and every filename evaluated. Comparing old and new packing gave mean absolute score differences of 0.013-0.018 and 10-11 common top-twelve results; repeated runs of the same configuration varied by about 0.018 too. This is consistent with normal run-to-run variation, not proof of equal quality. The full experiment's returned usage totaled about 8.63 million tokens, or $0.36 at the published rate; failed/aborted work may add unreported charges. Raw responses remain in ignored private storage and are not sent to telemetry services.
+
+### Follow-up: would larger requests beat more of them?
+
+A later request asked whether raising the question cap to 400/request, with enough parallel requests to cover the whole catalog in one wave, would reduce total completion time (not just first-result time). `packQuestions` closes a batch at whichever limit it reaches first. At roughly 580 bytes per question, 100 questions fit within 60,000 bytes, but raising the question cap alone cannot produce 200- or 400-question requests under that byte guard.
+
+**First pass (concurrency-only, corrected labels).** An initial benchmark against the live Fly `iad` deployment used the real `packQuestions`/`evaluateQuestions` production path at several nominal batch-size settings. Every nominal setting (100/200/400) actually produced **19 real ~100-question requests per ranking** under the production packing limits; the dispatch concurrency ceiling differed. The "200x10" and "400x5" labels used below were mislabeled in an earlier draft of this section — they never sent real 200- or 400-question requests, only 19 real ~100-question requests dispatched with 10 or 5 concurrent workers respectively:
+
+| Concurrency (real requests/ranking: 19) | Runs | Median | Mean | Min | Max |
+| --- | --- | --- | --- | --- | --- |
+| 12 (old baseline) | 4 | 453 ms | 493 ms | 438 ms | 628 ms |
+| **19** (new, 1 wave) | 4 | **329 ms** | 331 ms | 298 ms | 366 ms |
+| 24 (same 19-request workload) | 4 | 417 ms | 421 ms | 315 ms | 535 ms |
+| 10 (was mislabeled "200x10") | 4 | 498 ms | 513 ms | 485 ms | 570 ms |
+| 5 (was mislabeled "400x5") | 4 | 885 ms | 888 ms | 860 ms | 921 ms |
+
+All 20 runs succeeded (0 failures), with similar per-request token usage (~14,688-15,100 max input tokens, ~580 bytes/question) across every row. The 19-worker case had a median about 27% below the 12-worker baseline in this small sample. With only 19 requests, ceilings of 19, 20, and 24 permit the same maximum useful concurrency for an otherwise idle pool; different observed timings do not establish a performance penalty for 24. This first pass is **not** evidence about genuinely larger requests.
+
+**Second pass (genuine 400-question requests).** To test that question directly, a small benchmark on the same Fly `iad` deployment chunked the same 1,884-file catalog purely by count (bypassing `packQuestions`'s byte cap, inside the benchmark harness only — `jev.mjs`'s production cap was never touched) into real 400-question batches (`[400, 400, 400, 400, 284]`, 5 requests/ranking) and compared them, interleaved across the same synthetic messages, against the real 100-question/19-request path at concurrency 20 (single wave for both):
+
+| Config (genuine questions x concurrency) | Real requests/ranking | Runs | Elapsed (oops / relax / final) | Mean |
+| --- | --- | --- | --- | --- |
+| 400 x 6 (genuine, count-chunked, bypasses byte cap) | 5 | 3 | 610 / 510 / 504 ms | 541 ms |
+| **100 x 20** (genuine, production path, current setting) | 19 | 3 | 498 / 561 / 299 ms | 453 ms |
+
+All 6 runs succeeded (0 failures). Genuine 100-question/concurrency-20 was faster in 2 of 3 paired comparisons and faster on average (453 ms vs 541 ms mean), but the samples overlap and are too small to establish a reliable performance margin. The controlled 400-question requests **did fit Jev's token window**: reported sizes were about 230 KB and 56,764 input tokens. They exceed the app's conservative 60,000-byte guard, which is not the same thing as the provider's token limit. General support for 400 would require raising the question cap and revising that byte guard with reliable handling of long messages and filenames; it would not require raising Jev's token limit. Since this test did not demonstrate a total-time advantage for 400, the production packing limits remain unchanged.
+
+**Updated setting: `MAX_PARALLEL_REQUESTS` raised from 12 to 20**, one more than the current catalog's exact 19-batch need, giving minimal headroom without unboundedly scaling the shared, cross-viewer pool. With free capacity, all 19 requests can start together and scoring finishes when the slowest completes. Otherwise workers start queued requests as slots become available; there are no fixed synchronization waves or exact elapsed-time formula. `MAX_QUESTIONS_PER_REQUEST` (100) and `MAX_REQUEST_BYTES` (60,000) are unchanged. Single-wave dispatch is not guaranteed across simultaneous viewers or a substantially larger catalog. Existing byte-cap edge-case tests (`test/jev.test.mjs`) cover long/Unicode inputs without a chars/4 heuristic, and a new test confirms the current full catalog fits one concurrency wave under the raised ceiling.
 
 ## How filename ranking works
 
